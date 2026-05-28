@@ -1,10 +1,3 @@
-//
-//  CodeTalkerApp.swift
-//  CodeTalker
-//
-//  Created by Peter C. Allport on 5/27/26.
-//
-
 import SwiftUI
 
 @main
@@ -13,5 +6,8 @@ struct CodeTalkerApp: App {
         WindowGroup {
             ContentView()
         }
+        #if os(macOS)
+        .defaultSize(width: 390, height: 590)
+        #endif
     }
 }

@@ -272,6 +272,7 @@ final class SideNotchView: NSView {
     private var isExpanded = false
     private var selectedRowIndex = DockData.items.firstIndex(where: { $0.isSelected }) ?? 0
     private var rowViews: [DockRowView] = []
+    private let voiceInputBarView = VoiceInputBarView()
     private let settingsIconView = SettingsIconView()
 
     override init(frame frameRect: NSRect) {
@@ -430,16 +431,16 @@ final class SideNotchView: NSView {
     override func layout() {
         super.layout()
         let rowWidth = panelWidth - leftPadding - rightPadding
-        let waveformHeight: CGFloat = 44
+        let inputHeight: CGFloat = 48
 
-        subviews.first(where: { $0.identifier?.rawValue == "waveform" })?.frame = CGRect(
+        voiceInputBarView.frame = CGRect(
             x: leftPadding,
             y: topPadding,
             width: rowWidth,
-            height: waveformHeight
+            height: inputHeight
         )
 
-        var y = topPadding + waveformHeight + 10
+        var y = topPadding + inputHeight + 10
         for row in rowViews {
             row.frame = CGRect(x: leftPadding, y: y, width: rowWidth, height: rowHeight)
             y += rowHeight + rowGap
@@ -455,7 +456,7 @@ final class SideNotchView: NSView {
     }
 
     private func buildRows() {
-        addSubview(AudioWaveformPillView())
+        addSubview(voiceInputBarView)
 
         for (index, item) in DockData.items.enumerated() {
             let row = DockRowView(item: item, isSelected: index == selectedRowIndex) { [weak self] in
@@ -503,16 +504,24 @@ final class SettingsIconView: NSView {
     }
 }
 
-final class AudioWaveformPillView: NSView {
+final class VoiceInputBarView: NSView {
     private let waveformView = AudioWaveformView()
+    private let micButton = NSButton()
+    private var isListening = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        identifier = NSUserInterfaceItemIdentifier("waveform")
+        identifier = NSUserInterfaceItemIdentifier("voiceInput")
         wantsLayer = true
-        layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.cornerRadius = 16
+        layer?.masksToBounds = true
+        layer?.backgroundColor = NSColor.white.withAlphaComponent(0.13).cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
 
+        configureMicButton()
         addSubview(waveformView)
+        addSubview(micButton)
     }
 
     required init?(coder: NSCoder) {
@@ -523,7 +532,70 @@ final class AudioWaveformPillView: NSView {
 
     override func layout() {
         super.layout()
-        waveformView.frame = bounds.insetBy(dx: 10, dy: 8)
+        let micSize: CGFloat = 30
+        let rightInset: CGFloat = 8
+        let verticalInset: CGFloat = 8
+
+        micButton.frame = CGRect(
+            x: bounds.maxX - rightInset - micSize,
+            y: (bounds.height - micSize) / 2,
+            width: micSize,
+            height: micSize
+        )
+
+        waveformView.frame = CGRect(
+            x: 16,
+            y: verticalInset,
+            width: max(0, micButton.frame.minX - 28),
+            height: bounds.height - verticalInset * 2
+        )
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    private func configureMicButton() {
+        micButton.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Start voice input")
+        micButton.imagePosition = .imageOnly
+        micButton.isBordered = false
+        micButton.wantsLayer = true
+        micButton.layer?.cornerRadius = 15
+        micButton.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.17).cgColor
+        micButton.contentTintColor = NSColor.white.withAlphaComponent(0.88)
+        micButton.target = self
+        micButton.action = #selector(toggleListening)
+    }
+
+    @objc private func toggleListening() {
+        setListening(!isListening)
+    }
+
+    private func setListening(_ listening: Bool) {
+        guard isListening != listening else { return }
+        isListening = listening
+
+        if listening {
+            MicrophoneLevelMonitor.shared.start()
+        } else {
+            MicrophoneLevelMonitor.shared.stop()
+        }
+
+        waveformView.setListening(listening)
+        updateListeningAppearance()
+    }
+
+    private func updateListeningAppearance() {
+        let highlight = isListening ? NSColor.systemBlue.withAlphaComponent(0.42) : NSColor.white.withAlphaComponent(0.13)
+        let border = isListening ? NSColor.systemBlue.withAlphaComponent(0.66) : NSColor.white.withAlphaComponent(0.12)
+        layer?.backgroundColor = highlight.cgColor
+        layer?.borderColor = border.cgColor
+        micButton.layer?.backgroundColor = (isListening ? NSColor.systemBlue : NSColor.white.withAlphaComponent(0.17)).cgColor
+        micButton.contentTintColor = .white
+        micButton.image = NSImage(
+            systemSymbolName: isListening ? "mic.fill" : "mic",
+            accessibilityDescription: isListening ? "Stop voice input" : "Start voice input"
+        )
     }
 }
 
@@ -532,7 +604,7 @@ final class MicrophoneLevelMonitor: @unchecked Sendable {
 
     private let engine = AVAudioEngine()
     private let lock = NSLock()
-    private var didAttemptStart = false
+    private var didRequestPermission = false
     private var currentLevel: CGFloat = 0
 
     var level: CGFloat {
@@ -541,14 +613,15 @@ final class MicrophoneLevelMonitor: @unchecked Sendable {
         return currentLevel
     }
 
-    func startIfNeeded() {
-        guard !didAttemptStart else { return }
-        didAttemptStart = true
+    func start() {
+        guard !engine.isRunning else { return }
 
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             startEngine()
         case .notDetermined:
+            guard !didRequestPermission else { return }
+            didRequestPermission = true
             guard Bundle.main.object(forInfoDictionaryKey: "NSMicrophoneUsageDescription") != nil else {
                 return
             }
@@ -566,7 +639,20 @@ final class MicrophoneLevelMonitor: @unchecked Sendable {
         }
     }
 
+    func stop() {
+        guard engine.isRunning else {
+            updateLevel(0, smoothing: 0)
+            return
+        }
+
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        updateLevel(0, smoothing: 0)
+    }
+
     private func startEngine() {
+        guard !engine.isRunning else { return }
+
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
 
@@ -608,6 +694,7 @@ final class AudioWaveformView: NSView {
     private var bars: [CGFloat]
     private var displayLink: Timer?
     private var phase: CGFloat = 0
+    private var isListening = false
 
     override init(frame frameRect: NSRect) {
         self.bars = Array(repeating: 0.12, count: barCount)
@@ -629,7 +716,13 @@ final class AudioWaveformView: NSView {
             displayLink?.invalidate()
             displayLink = nil
         } else {
-            MicrophoneLevelMonitor.shared.startIfNeeded()
+            startAnimatingIfNeeded()
+        }
+    }
+
+    func setListening(_ listening: Bool) {
+        isListening = listening
+        if listening {
             startAnimatingIfNeeded()
         }
     }
@@ -639,13 +732,16 @@ final class AudioWaveformView: NSView {
 
         guard !bars.isEmpty else { return }
 
+        NSBezierPath(rect: bounds).addClip()
+
         let availableWidth = bounds.width
         let barWidth: CGFloat = 2
-        let spacing = max(4, (availableWidth - CGFloat(barCount) * barWidth) / CGFloat(max(1, barCount - 1)))
+        let naturalSpacing = (availableWidth - CGFloat(barCount) * barWidth) / CGFloat(max(1, barCount - 1))
+        let spacing = max(1.5, naturalSpacing)
         let centerY = bounds.midY
         let maxBarHeight = bounds.height * 0.70
 
-        NSColor.white.withAlphaComponent(0.86).setFill()
+        NSColor.white.withAlphaComponent(isListening ? 0.9 : 0.42).setFill()
 
         for (index, value) in bars.enumerated() {
             let x = CGFloat(index) * (barWidth + spacing)
@@ -671,16 +767,19 @@ final class AudioWaveformView: NSView {
     private func tick() {
         phase += 0.16
 
-        let inputLevel = MicrophoneLevelMonitor.shared.level
-        let idleMovement = (sin(phase) + 1) * 0.035
+        let liveLevel = isListening ? MicrophoneLevelMonitor.shared.level : 0
+        let speakingPulse = isListening ? pow((sin(phase * 1.55) + 1) / 2, 2) * 0.22 : 0
+        let inputLevel = max(liveLevel, speakingPulse)
+        let idleMovement = (sin(phase) + 1) * (isListening ? 0.035 : 0.014)
         let newValue = min(1, max(0.08, inputLevel + idleMovement))
 
         bars.removeFirst()
         bars.append(newValue)
 
         for index in bars.indices {
-            let ripple = (sin(phase + CGFloat(index) * 0.46) + 1) * 0.04
-            bars[index] = min(1, max(0.08, bars[index] * 0.90 + ripple))
+            let ripple = (sin(phase + CGFloat(index) * 0.46) + 1) * (isListening ? 0.04 : 0.012)
+            let decay: CGFloat = isListening ? 0.90 : 0.82
+            bars[index] = min(1, max(0.08, bars[index] * decay + ripple))
         }
 
         needsDisplay = true
